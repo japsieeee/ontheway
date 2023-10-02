@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:math' show cos, sqrt, asin, min, max;
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,6 +9,7 @@ import 'package:geocoding/geocoding.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:loading_animation_widget/loading_animation_widget.dart';
+import 'package:http/http.dart' as http;
 
 import 'package:location/location.dart' as location_package;
 
@@ -40,13 +41,14 @@ class MapSample extends StatefulWidget {
 class MapSampleState extends State<MapSample> {
   bool _isLoading = false;
   bool _searchInputIsNotEmpty = false;
+  bool avoidTolls = true;
 
   BitmapDescriptor sourceIcon = BitmapDescriptor.defaultMarker;
 
   final location_package.Location _location = location_package.Location();
-  late location_package.LocationData _locationData;
 
-  double _totalDistance = 0;
+  String _totalDistance = "";
+  String _totalDuration = "";
   bool _mapIsReadyToShow = false;
 
   LatLng _currentLocation = const LatLng(0, 0);
@@ -88,7 +90,7 @@ class MapSampleState extends State<MapSample> {
 
       LocationPermission permission = await Geolocator.checkPermission();
 
-      if (permission == LocationPermission.denied) {
+      if (permission == LocationPermission.denied || !serviceEnabled) {
         LocationPermission nextPermission =
             await Geolocator.requestPermission();
 
@@ -120,14 +122,6 @@ class MapSampleState extends State<MapSample> {
             // animate camera
             controller.animateCamera(CameraUpdate.newCameraPosition(
                 CameraPosition(target: updatedLocation, zoom: 19)));
-
-            PolylineResult result =
-                await _makePolyPointPath(updatedLocation, _destination);
-
-            if (result.points.isNotEmpty) {
-              double distance = _getDistance(result.points);
-              _totalDistance = distance;
-            }
           }
 
           setState(() {
@@ -171,7 +165,6 @@ class MapSampleState extends State<MapSample> {
       String pointBText = destinationLocationInputController.text;
 
       if (pointBText.isNotEmpty) {
-        List<LatLng> newPolyLineCoordinates = [];
         Set<Polyline> newPolyLines = {};
 
         List<Location> locationB = await locationFromAddress(pointBText);
@@ -181,36 +174,22 @@ class MapSampleState extends State<MapSample> {
         List<LatLng> paths = <LatLng>[_currentLocation, pointBCoordinates];
         List<Marker> newMarks = <Marker>[];
 
+        final List<LatLng> routePoints =
+            await fetchDirections(pointBCoordinates);
+
         for (var i = 0; i < 2; i++) {
           newMarks
               .add(Marker(markerId: MarkerId("mark $i"), position: paths[i]));
         }
 
-        PolylineResult result =
-            await _makePolyPointPath(_currentLocation, pointBCoordinates);
+        newPolyLines.add(Polyline(
+            polylineId: const PolylineId("polyline direction"),
+            width: 6,
+            points: routePoints,
+            color: Colors.blueAccent));
 
-        if (result.points.isNotEmpty) {
-          double distance = _getDistance(result.points);
-
-          for (var point in result.points) {
-            newPolyLineCoordinates.add(LatLng(point.latitude, point.longitude));
-          }
-
-          newPolyLines.add(Polyline(
-              polylineId: const PolylineId("polyline direction"),
-              width: 6,
-              points: newPolyLineCoordinates,
-              color: Colors.blueAccent));
-
-          // center camera automatically on the traveling directions
-          GoogleMapController controller = await _controller.future;
-          LatLngBounds bounds = _getBounds(newMarks);
-          controller.animateCamera(CameraUpdate.newLatLngBounds(bounds, 50));
-
-          _totalDistance = distance;
-          polyLines = newPolyLines;
-          _destination = pointBCoordinates;
-        }
+        polyLines = newPolyLines;
+        _destination = pointBCoordinates;
       }
     } catch (e) {
       showDialog(
@@ -229,60 +208,47 @@ class MapSampleState extends State<MapSample> {
     }
   }
 
-  Future<PolylineResult> _makePolyPointPath(
-      LatLng loc, LatLng pointBCoordinates) async {
-    // making path / poly-lines
-    String mapApiKey = "${dotenv.env['GOOGLE_MAP_DIRECTIONS_API_KEY']}";
+  Future<List<LatLng>> fetchDirections(LatLng dest) async {
+    String apiKey = "${dotenv.env['GOOGLE_MAP_DIRECTIONS_API_KEY']}";
+    final origin =
+        "${_currentLocation.latitude}, ${_currentLocation.longitude}";
+    final destination = "${dest.latitude}, ${dest.longitude}";
 
-    PolylineResult result = await polylinePoints.getRouteBetweenCoordinates(
-      mapApiKey,
-      avoidTolls: true,
-      PointLatLng(loc.latitude, loc.longitude),
-      PointLatLng(pointBCoordinates.latitude, pointBCoordinates.longitude),
-    );
+    String uri =
+        "https://maps.googleapis.com/maps/api/directions/json?avoid=${avoidTolls ? "tolls" : ""}&origin=$origin&destination=$destination&key=$apiKey";
 
-    return result;
-  }
+    final response = await http.get(Uri.parse(uri));
 
-  LatLngBounds _getBounds(List<Marker> markers) {
-    var lngs = markers.map<double>((m) => m.position.longitude).toList();
-    var lats = markers.map<double>((m) => m.position.latitude).toList();
+    if (response.statusCode == 200) {
+      final decoded = json.decode(response.body);
 
-    double topMost = lngs.reduce(max);
-    double leftMost = lats.reduce(min);
-    double rightMost = lats.reduce(max);
-    double bottomMost = lngs.reduce(min);
+      final routes = decoded['routes'][0]['overview_polyline']['points'];
+      final distance = decoded['routes'][0]['legs'][0]['distance']['text'];
+      final duration = decoded['routes'][0]['legs'][0]['duration']['text'];
+      var nelat = decoded['routes'][0]['bounds']['northeast']['lat'];
+      var nelng = decoded['routes'][0]['bounds']['northeast']['lng'];
 
-    LatLngBounds bounds = LatLngBounds(
-      northeast: LatLng(rightMost, topMost),
-      southwest: LatLng(leftMost, bottomMost),
-    );
+      var swlat = decoded['routes'][0]['bounds']['southwest']['lat'];
+      var swlng = decoded['routes'][0]['bounds']['southwest']['lng'];
 
-    return bounds;
-  }
+      // center camera automatically on the traveling directions
+      LatLngBounds bounds = LatLngBounds(
+          southwest: LatLng(swlat, swlng), northeast: LatLng(nelat, nelng));
 
-  double _coordinateDistance(lat1, lon1, lat2, lon2) {
-    var p = 0.017453292519943295;
-    var c = cos;
-    var a = 0.5 -
-        c((lat2 - lat1) * p) / 2 +
-        c(lat1 * p) * c(lat2 * p) * (1 - c((lon2 - lon1) * p)) / 2;
-    return 12742 * asin(sqrt(a));
-  }
+      GoogleMapController controller = await _controller.future;
+      controller.animateCamera(CameraUpdate.newLatLngBounds(bounds, 50));
 
-  double _getDistance(polylineCoordinates) {
-    double totalDistance = 0;
+      final List<LatLng> points = PolylinePoints()
+          .decodePolyline(routes)
+          .map((e) => LatLng(e.latitude, e.longitude))
+          .toList();
 
-    for (int i = 0; i < polylineCoordinates.length - 1; i++) {
-      totalDistance += _coordinateDistance(
-        polylineCoordinates[i].latitude,
-        polylineCoordinates[i].longitude,
-        polylineCoordinates[i + 1].latitude,
-        polylineCoordinates[i + 1].longitude,
-      );
+      _totalDistance = distance;
+      _totalDuration = duration;
+      return points;
+    } else {
+      throw Exception('Failed to load directions');
     }
-
-    return totalDistance;
   }
 
   @override
@@ -299,6 +265,7 @@ class MapSampleState extends State<MapSample> {
               child: Stack(
                 children: [
                   GoogleMap(
+                    polylines: polyLines,
                     myLocationEnabled: false,
                     myLocationButtonEnabled: false,
                     padding: const EdgeInsets.fromLTRB(0, 120, 0, 10),
@@ -311,7 +278,6 @@ class MapSampleState extends State<MapSample> {
                           markerId: const MarkerId("destination"),
                           position: _destination)
                     },
-                    polylines: polyLines,
                     initialCameraPosition: _initialCameraPosition,
                     zoomControlsEnabled: false,
                     trafficEnabled: _isTrafficEnabled,
@@ -392,7 +358,8 @@ class MapSampleState extends State<MapSample> {
                                           setState(() {
                                             _destination = const LatLng(0, 0);
                                             _searchInputIsNotEmpty = false;
-                                            _totalDistance = 0;
+                                            _totalDistance = "";
+                                            _totalDuration = "";
                                             polyLines = {};
                                           });
                                         },
@@ -407,17 +374,25 @@ class MapSampleState extends State<MapSample> {
                         ),
                       ),
                       Visibility(
-                        visible: _totalDistance != 0 ? true : false,
+                        visible: _totalDistance.isNotEmpty ? true : false,
                         child: Padding(
                           padding: const EdgeInsets.fromLTRB(15, 0, 15, 0),
                           child: Container(
                             color: Colors.blueAccent,
                             padding: const EdgeInsets.all(8),
-                            child: Text(
-                                "Total Distance: ${_totalDistance.toStringAsFixed(2)} km",
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.white)),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text("Distance: $_totalDistance",
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.white)),
+                                Text("Duration: $_totalDuration",
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.white)),
+                              ],
+                            ),
                           ),
                         ),
                       )
@@ -426,34 +401,74 @@ class MapSampleState extends State<MapSample> {
                 ],
               ),
             ),
-      floatingActionButton: Row(
-        mainAxisAlignment: MainAxisAlignment.end,
-        children: [
-          Visibility(
-            visible: _isLoading ? false : true,
-            child: Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: FloatingActionButton(
-                backgroundColor: Colors.green,
-                onPressed: () {
-                  _findRoute();
-                },
-                child: const Icon(Icons.directions),
+      floatingActionButton: Container(
+        // color: Colors.red,
+        padding: const EdgeInsets.fromLTRB(30, 0, 0, 0),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Column(
+              mainAxisAlignment: MainAxisAlignment.end,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  child: SizedBox(
+                    height: 50,
+                    width: 50,
+                    child: FloatingActionButton(
+                      backgroundColor: Colors.amber,
+                      onPressed: () {
+                        if (_totalDistance.isNotEmpty) {
+                          _findRoute();
+                        }
+
+                        setState(() {
+                          avoidTolls = !avoidTolls;
+                        });
+                      },
+                      child: Icon(avoidTolls ? Icons.motorcycle : Icons.car_repair),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  height: 50,
+                  width: 50,
+                  child: FloatingActionButton(
+                    backgroundColor:
+                        _isTrafficEnabled ? Colors.grey : Colors.blueAccent,
+                    onPressed: () {
+                      toggleTrafficEnable();
+                    },
+                    child: const Icon(Icons.traffic),
+                  ),
+                ),
+              ],
+            ),
+            Visibility(
+              visible: _isLoading ? false : true,
+              child: SizedBox(
+                width: 70,
+                height: 45,
+                child: FloatingActionButton(
+                  shape: BeveledRectangleBorder(borderRadius: BorderRadius.circular(2)),
+                  backgroundColor: Colors.green,
+                  onPressed: () {
+                    _findRoute();
+                  },
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      Icon(Icons.directions),
+                      Text("Go", style: TextStyle(fontSize: 14)),
+                    ],
+                  ),
+                ),
               ),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: FloatingActionButton(
-              backgroundColor:
-                  _isTrafficEnabled ? Colors.grey : Colors.blueAccent,
-              onPressed: () {
-                toggleTrafficEnable();
-              },
-              child: const Icon(Icons.traffic),
-            ),
-          )
-        ],
+          ],
+        ),
       ),
     );
   }
